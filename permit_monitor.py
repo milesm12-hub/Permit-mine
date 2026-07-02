@@ -276,11 +276,29 @@ def fetch_echo_records(state: str, naics_prefix: str = "2211", timeout=30):
     }
     url = f"{ECHO_FACILITY_SEARCH_URL}?{urllib.parse.urlencode(params)}"
 
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        print(f"[ERROR] ECHO facility search failed: {e}", file=sys.stderr)
+    max_attempts = 4
+    backoff = 5
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code == 429 and attempt < max_attempts:
+                print(f"[WARN] ECHO rate limited (429), retrying in {backoff} seconds...", file=sys.stderr)
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            print(f"[ERROR] ECHO facility search failed: {e}", file=sys.stderr)
+            return []
+        except Exception as e:
+            last_error = e
+            print(f"[ERROR] ECHO facility search failed: {e}", file=sys.stderr)
+            return []
+    else:
+        print(f"[ERROR] ECHO facility search failed after {max_attempts} attempts: {last_error}", file=sys.stderr)
         return []
 
     results = data.get("Results", {}).get("Facilities", [])
