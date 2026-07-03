@@ -62,7 +62,9 @@ private repo or back up — it's the only persistent state this tool has.
 """
 
 import argparse
+import csv
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -76,8 +78,10 @@ DB_PATH = "permits.db"
 
 # EPA ECHO Facility Search + Air Compliance endpoints.
 # Ref: https://echo.epa.gov/tools/web-services
-ECHO_FACILITY_SEARCH_URL = "https://echodata.epa.gov/echo/echo_rest_services.get_facilities"
+ECHO_FACILITY_SEARCH_URL = "https://echodata.epa.gov/echo/air_rest_services.get_facilities"
 ECHO_AIR_DETAIL_URL = "https://echodata.epa.gov/echo/air_rest_services.get_facility_info"
+ECHO_QID_URL = "https://echodata.epa.gov/echo/air_rest_services.get_qid"
+ECHO_DOWNLOAD_URL = "https://echodata.epa.gov/echo/air_rest_services.get_download"
 
 # Turbine models Edge Generation tracks. Extend as needed.
 TRACKED_EQUIPMENT = [
@@ -90,6 +94,11 @@ TRACKED_ENTITIES = [
     "NEXUS", "NEXUS HUBBARD", "GEW", "BAYSIDE POWER", "EVERLEIGH",
     "MANNING IND", "EDGE GENERATION", "WNT ENERGY", "MASSIVE TECH",
     "HALCYON ENERGY", "GRUPO COX",
+]
+
+# Disposition keywords to flag auctions / scrapped equipment signals.
+TRACKED_DISPOSITION_TERMS = [
+    "AUCTION", "ONLINE AUCTION", "SCRAP", "SCRAPPED",
 ]
 
 # Statuses considered "closed out" for the purposes of a surplus signal.
@@ -125,6 +134,14 @@ class PermitRecord:
     def matches_tracked_entity(self):
         name = f"{self.facility_name} {self.owner_entity}".upper()
         return [e for e in TRACKED_ENTITIES if e in name]
+
+    def matches_tracked_disposition(self):
+        text = " ".join([
+            self.equipment_desc or "",
+            self.facility_name or "",
+            self.owner_entity or "",
+        ]).upper()
+        return [t for t in TRACKED_DISPOSITION_TERMS if t in text]
 
 
 # ---------------------------------------------------------------------------
@@ -253,27 +270,28 @@ def log_change(conn, state, signal_type, permit_id, facility_name,
 # EPA ECHO fetch
 # ---------------------------------------------------------------------------
 
+def get_epa_api_key():
+    return os.getenv("EPA_API_KEY") or os.getenv("ECHO_API_KEY") or os.getenv("EPA_KEY") or os.getenv("API_KEY")
+
+
 def fetch_echo_records(state: str, naics_prefix: str = "2211", timeout=30):
     """
     Query EPA ECHO for air-permitted facilities in a state.
 
-    naics_prefix defaults to 2211 (Electric Power Generation, Transmission
-    and Distribution). Widen or split this if you want to also catch
-    industrial cogen / standby generation sites under other NAICS codes.
-
-    NOTE: field names below (FacName, RegistryID, CWPStatus, etc.) follow
-    ECHO's documented output_fields for get_facilities / get_facility_info.
-    Verify against https://echo.epa.gov/tools/web-services/facility-search-water
-    (air equivalent) if the API returns an unexpected shape — ECHO does
-    revise field names occasionally.
+    The live EPA air-search service now returns a query identifier (QID) and
+    a page of facility rows. This function uses that endpoint first and then
+    converts the returned live payload into PermitRecord objects.
     """
     params = {
         "output": "JSON",
         "p_st": state,
-        "p_act": "Y",  # active facilities; adjust/remove to widen the pull
+        "p_act": "Y",
         "p_naics": naics_prefix,
-        "responseset": "5000",
+        "responseset": "1",
     }
+    api_key = get_epa_api_key()
+    if api_key:
+        params["key"] = api_key
     url = f"{ECHO_FACILITY_SEARCH_URL}?{urllib.parse.urlencode(params)}"
 
     max_attempts = 4
@@ -301,17 +319,104 @@ def fetch_echo_records(state: str, naics_prefix: str = "2211", timeout=30):
         print(f"[ERROR] ECHO facility search failed after {max_attempts} attempts: {last_error}", file=sys.stderr)
         return []
 
-    results = data.get("Results", {}).get("Facilities", [])
+    results = data.get("Results", {})
+    if not results:
+        return []
+
+    qid = results.get("QueryID")
+    if qid:
+        parsed = fetch_qid_page(qid, timeout=timeout)
+        if parsed:
+            return parsed
+
+    facilities = results.get("Facilities", [])
+    records = parse_epa_facility_payload({"Results": {"Facilities": facilities}})
+    if records:
+        return records
+
+    return []
+
+
+def fetch_qid_page(qid: str, timeout=30):
+    if not qid:
+        return []
+    params = {
+        "output": "CSV",
+        "qid": qid,
+        "qcolumns": "RegistryID,FacName,Owner,State,PermitStatus,EmissionUnitDesc,CapacityMW,IssueDate,ExpirationDate,LastActionDate",
+    }
+    api_key = get_epa_api_key()
+    if api_key:
+        params["key"] = api_key
+    url = f"{ECHO_DOWNLOAD_URL}?{urllib.parse.urlencode(params)}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "ignore")
+    except Exception as e:
+        print(f"[WARN] ECHO download failed for {qid}: {e}", file=sys.stderr)
+        return []
+
+    return parse_epa_csv_payload(text)
+
+
+def parse_epa_csv_payload(csv_text: str):
+    if not csv_text:
+        return []
+    lines = [line for line in csv_text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return []
+
+    rows = []
+    for line in lines[1:]:
+        if line.startswith('"AIRName"'):
+            continue
+        try:
+            parts = next(csv.reader([line]))
+        except Exception:
+            continue
+        if not parts:
+            continue
+        facility_name = parts[0].strip() if len(parts) > 0 else ""
+        registry_id = parts[1].strip() if len(parts) > 1 else ""
+        if not registry_id:
+            continue
+        rows.append(PermitRecord(
+            permit_id=registry_id,
+            facility_name=facility_name,
+            owner_entity="",
+            state="",
+            status="",
+            equipment_desc="",
+            capacity_mw=None,
+            issue_date=None,
+            expiration_date=None,
+            last_action_date=None,
+            raw={"source": "csv", "facility_name": facility_name, "registry_id": registry_id},
+        ))
+    return rows
+
+
+def parse_epa_facility_payload(payload: dict):
+    results = payload.get("Results", {}) or {}
+    facilities = results.get("Facilities", []) or []
     records = []
-    for f in results:
-        registry_id = f.get("RegistryID", "")
-        facility_name = f.get("FacName", "")
-        # Air-specific detail (permit id, status, equipment) needs a
-        # second call per facility against ICIS-AIR / get_facility_info.
-        detail = fetch_air_detail(registry_id, timeout=timeout)
-        for permit in detail:
-            records.append(permit)
-        time.sleep(0.2)  # basic self-throttling; ECHO rate-limits bulk pulls
+    for f in facilities:
+        registry_id = str(f.get("RegistryID") or "").strip()
+        if not registry_id:
+            continue
+        records.append(PermitRecord(
+            permit_id=registry_id,
+            facility_name=f.get("FacName") or f.get("AIRName") or "",
+            owner_entity=f.get("Owner") or f.get("OwnerEntity") or f.get("FacName") or "",
+            state=(f.get("State") or "").upper(),
+            status=(f.get("PermitStatus") or "").upper(),
+            equipment_desc=f.get("EmissionUnitDesc") or "",
+            capacity_mw=safe_float(f.get("CapacityMW")),
+            issue_date=f.get("IssueDate"),
+            expiration_date=f.get("ExpirationDate"),
+            last_action_date=f.get("LastActionDate"),
+            raw=f,
+        ))
     return records
 
 
@@ -379,6 +484,12 @@ def diff_snapshots(conn, state, prior_id, latest_id):
                            rec.status, equip, entity,
                            note="New pending/draft permit filing.")
                 changes.append((pid, "EARLY_BUYER_LEAD"))
+            if rec.matches_tracked_disposition():
+                log_change(conn, state, "AUCTION_SCRAP_SIGNAL", pid,
+                           rec.facility_name, rec.owner_entity, None,
+                           rec.status, equip, entity,
+                           note="Disposition keywords detected in permit record.")
+                changes.append((pid, "AUCTION_SCRAP_SIGNAL"))
             continue
 
         old = prior[pid]
@@ -402,6 +513,13 @@ def diff_snapshots(conn, state, prior_id, latest_id):
                        rec.owner_entity, equip, entity,
                        note="Owner/permittee of record changed.")
             changes.append((pid, "OWNERSHIP_SIGNAL"))
+
+        if rec.matches_tracked_disposition() and not old.matches_tracked_disposition():
+            log_change(conn, state, "AUCTION_SCRAP_SIGNAL", pid,
+                       rec.facility_name, rec.owner_entity, old.status,
+                       rec.status, equip, entity,
+                       note="Disposition keywords newly detected in permit record.")
+            changes.append((pid, "AUCTION_SCRAP_SIGNAL"))
 
     conn.commit()
     return changes

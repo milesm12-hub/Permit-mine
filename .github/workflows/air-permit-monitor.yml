@@ -27,6 +27,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run permit fetch (Texas)
+        env:
+          EPA_API_KEY: ${{ secrets.EPA_API_KEY }}
         run: python permit_monitor.py fetch --state TX
 
       - name: Export changelog to Excel

@@ -7,6 +7,10 @@ Air permit change detection and export tooling for the Edge Generation workflow.
 - `permit_monitor.py` — fetches air permit snapshots from EPA ECHO, stores them in `permits.db`, and diffs the latest two snapshots.
 - `export_changelog_xlsx.py` — reads the `changelog` table from `permits.db` and exports a formatted Excel workbook at `air_permit_changelog.xlsx`.
 - `requirements.txt` — Python dependencies required for the Excel export.
+
+## New signal type
+
+- The tool now also detects `AUCTION_SCRAP_SIGNAL` when permit records contain auction or scrap disposition keywords in their equipment/facility/owner descriptions.
 - `.github/workflows/air-permit-monitor.yml` — scheduled GitHub Actions workflow that fetches TX permits, exports the changelog, and commits updated artifacts.
 - `.github/workflows/export_changelog.yml` — optional workflow to export the changelog workbook independently.
 
